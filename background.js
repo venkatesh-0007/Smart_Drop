@@ -1,28 +1,83 @@
-// background.js for Smart Drop Chrome Extension
+// background.js - Smart Drop Shared Service Worker
+const DB_NAME = 'SmartDropDB_v2';
+const STORE_NAME = 'vault';
+let db = null;
 
-// Handle installation
-chrome.runtime.onInstalled.addListener(() => {
-  console.log("Smart Drop Extension Installed");
-  
-  // Create context menu for AI Summarizer
-  chrome.contextMenus.create({
-    id: "smart-drop-summarize",
-    title: "Summarize with Smart Drop AI",
-    contexts: ["selection"]
-  });
+// Initialize database inside Extension Origin context
+const initDB = () => new Promise((resolve, reject) => {
+  const req = indexedDB.open(DB_NAME, 1);
+  req.onupgradeneeded = (e) => {
+    const d = e.target.result;
+    if (!d.objectStoreNames.contains(STORE_NAME)) {
+      d.createObjectStore(STORE_NAME, { keyPath: 'id', autoIncrement: true });
+    }
+  };
+  req.onsuccess = (e) => {
+    db = e.target.result;
+    migrateExistingData().then(() => resolve(db));
+  };
+  req.onerror = (e) => reject(e.target.error);
 });
 
-// Handle context menu clicks
-chrome.contextMenus.onClicked.addListener((info, tab) => {
-  if (info.menuItemId === "smart-drop-summarize") {
-    chrome.tabs.sendMessage(tab.id, {
-      action: "AI_SUMMARIZE",
-      text: info.selectionText
+// Migrates old base64 data URLs to raw Blobs
+const migrateExistingData = () => new Promise((resolve) => {
+  const tx = db.transaction([STORE_NAME], 'readwrite');
+  const store = tx.objectStore(STORE_NAME);
+  store.getAll().onsuccess = (e) => {
+    const records = e.target.result || [];
+    const promises = records.map(record => {
+      if (record.data && !record.file) {
+        try {
+          const blob = dataURLtoBlob(record.data);
+          if (blob) {
+            record.file = blob;
+            record.size = blob.size;
+            record.timestamp = record.timestamp || Date.now();
+            record.isFavorite = record.isFavorite || false;
+            record.lastUsed = record.lastUsed || record.timestamp || Date.now();
+            delete record.data; // Save storage space by removing base64 string
+            return new Promise((res) => {
+              const req = store.put(record);
+              req.onsuccess = () => res();
+              req.onerror = () => res();
+            });
+          }
+        } catch (err) {
+          console.error("Smart Drop background migration error:", record.name, err);
+        }
+      }
+      return Promise.resolve();
     });
-  }
+    Promise.all(promises).then(() => resolve());
+  };
 });
 
-// Relay messages
+const dataURLtoBlob = (dataurl) => {
+  if (!dataurl || !dataurl.includes(',')) return null;
+  try {
+    const arr = dataurl.split(',');
+    const match = arr[0].match(/:(.*?);/);
+    const mime = match ? match[1] : 'application/octet-stream';
+    const bstr = atob(arr[1]); 
+    let n = bstr.length; 
+    const u8 = new Uint8Array(n);
+    while (n--) u8[n] = bstr.charCodeAt(n);
+    return new Blob([u8], { type: mime });
+  } catch (e) {
+    return null;
+  }
+};
+
+const dbPromise = initDB();
+
+async function getDB() {
+  if (!db) {
+    db = await dbPromise;
+  }
+  return db;
+}
+
+// ─── MESSAGE LISTENERS ───
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === "OPEN_AUTH_WINDOW") {
     chrome.identity.getAuthToken({ interactive: true }, (token) => {
@@ -36,88 +91,215 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true; 
   }
 
-  if (request.action === "AI_REQUEST") {
-    handleAIRequest(request, sendResponse);
+  // DATABASE CRUD ROUTING (runs under Extension Origin)
+  if (request.action === "GET_VAULT_FILES") {
+    handleGetVaultFiles(sendResponse);
+    return true;
+  }
+  if (request.action === "SAVE_VAULT_FILE") {
+    handleSaveVaultFile(request.fileRecord, request.arrayBuffer, sendResponse);
+    return true;
+  }
+  if (request.action === "DELETE_VAULT_FILE") {
+    handleDeleteVaultFile(request.id, sendResponse);
+    return true;
+  }
+  if (request.action === "UPDATE_VAULT_FILE") {
+    handleUpdateVaultFile(request.fileRecord, sendResponse);
+    return true;
+  }
+  if (request.action === "CLEAR_VAULT") {
+    handleClearVault(sendResponse);
+    return true;
+  }
+  if (request.action === "GET_VAULT_SIZE") {
+    handleGetVaultSize(sendResponse);
+    return true;
+  }
+  if (request.action === "CHECK_DUPLICATE") {
+    handleCheckDuplicate(request.name, request.size, sendResponse);
+    return true;
+  }
+  if (request.action === "GET_FILE_CONTENT") {
+    handleGetFileContent(request.id, sendResponse);
     return true;
   }
 });
 
-async function handleAIRequest(request, sendResponse) {
-  const { provider, apiKey, prompt, text } = request;
-  
-  if (!apiKey) {
-    sendResponse({ success: false, error: "API Key is missing. Please add it in Settings." });
-    return;
-  }
-
-  const systemPrompt = "You are a helpful assistant. Provide clear, concise responses.";
-  
+async function handleGetVaultFiles(sendResponse) {
   try {
-    let response;
-    if (provider === "openai") {
-      response = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${apiKey}`
-        },
-        body: JSON.stringify({
-          model: "gpt-4o",
-          messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: `Text to summarize: ${text}\n\nUser request: ${prompt || "Summarize this text."}` }
-          ]
-        })
+    const database = await getDB();
+    const tx = database.transaction([STORE_NAME], 'readonly');
+    tx.objectStore(STORE_NAME).getAll().onsuccess = (e) => {
+      const records = e.target.result || [];
+      // Omit binary content when returning list metadata to prevent serialization errors
+      const metadataList = records.map(r => {
+        const meta = { ...r };
+        delete meta.file;
+        return meta;
       });
-    } else if (provider === "anthropic") {
-      response = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": apiKey,
-          "anthropic-version": "2023-06-01"
-        },
-        body: JSON.stringify({
-          model: "claude-3-5-sonnet-20241022",
-          max_tokens: 1024,
-          system: systemPrompt,
-          messages: [
-            { role: "user", content: `Text: ${text}\n\nRequest: ${prompt || "Summarize this."}` }
-          ]
-        })
-      });
-    } else if (provider === "google") {
-      response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          system_instruction: {
-            parts: [{ text: systemPrompt }]
-          },
-          contents: [
-            {
-              role: "user",
-              parts: [{ text: `Text: ${text}\n\nRequest: ${prompt || "Summarize this."}` }]
-            }
-          ],
-          generationConfig: {
-            maxOutputTokens: 1024
-          }
-        })
-      });
-    }
-
-    if (!response.ok) {
-      const errorData = await response.json();
-      throw new Error(errorData.error?.message || errorData.error || "API request failed");
-    }
-
-    const data = await response.json();
-    sendResponse({ success: true, data: data });
-  } catch (error) {
-    console.error("Smart Drop AI Error:", error.message);
-    sendResponse({ success: false, error: error.message });
+      sendResponse({ success: true, files: metadataList });
+    };
+  } catch (err) {
+    sendResponse({ success: false, error: err.message });
   }
+}
+
+async function handleSaveVaultFile(fileRecord, arrayBuffer, sendResponse) {
+  try {
+    const database = await getDB();
+    const tx = database.transaction([STORE_NAME], 'readwrite');
+    
+    // Reconstruct native Blob from arrayBuffer transfer
+    const blob = new Blob([arrayBuffer], { type: fileRecord.type });
+    fileRecord.file = blob;
+
+    tx.objectStore(STORE_NAME).add(fileRecord);
+    tx.oncomplete = () => {
+      sendResponse({ success: true });
+      broadcastUpdate();
+    };
+    tx.onerror = (err) => {
+      sendResponse({ success: false, error: err.target.error?.message || "Write error" });
+    };
+  } catch (err) {
+    sendResponse({ success: false, error: err.message });
+  }
+}
+
+async function handleDeleteVaultFile(id, sendResponse) {
+  try {
+    const database = await getDB();
+    const tx = database.transaction([STORE_NAME], 'readwrite');
+    tx.objectStore(STORE_NAME).delete(id);
+    tx.oncomplete = () => {
+      sendResponse({ success: true });
+      broadcastUpdate();
+    };
+    tx.onerror = (err) => {
+      sendResponse({ success: false, error: err.target.error?.message || "Delete error" });
+    };
+  } catch (err) {
+    sendResponse({ success: false, error: err.message });
+  }
+}
+
+async function handleUpdateVaultFile(fileRecord, sendResponse) {
+  try {
+    const database = await getDB();
+    const tx = database.transaction([STORE_NAME], 'readwrite');
+    
+    // Maintain existing Blob content if not provided in update payload
+    const store = tx.objectStore(STORE_NAME);
+    store.get(fileRecord.id).onsuccess = (e) => {
+      const existing = e.target.result;
+      if (existing) {
+        if (!fileRecord.file && existing.file) {
+          fileRecord.file = existing.file;
+        }
+        store.put(fileRecord);
+      }
+    };
+
+    tx.oncomplete = () => {
+      sendResponse({ success: true });
+      broadcastUpdate();
+    };
+    tx.onerror = (err) => {
+      sendResponse({ success: false, error: err.target.error?.message || "Update error" });
+    };
+  } catch (err) {
+    sendResponse({ success: false, error: err.message });
+  }
+}
+
+async function handleClearVault(sendResponse) {
+  try {
+    const database = await getDB();
+    const tx = database.transaction([STORE_NAME], 'readwrite');
+    tx.objectStore(STORE_NAME).clear();
+    tx.oncomplete = () => {
+      sendResponse({ success: true });
+      broadcastUpdate();
+    };
+    tx.onerror = (err) => {
+      sendResponse({ success: false, error: err.target.error?.message || "Clear error" });
+    };
+  } catch (err) {
+    sendResponse({ success: false, error: err.message });
+  }
+}
+
+async function handleGetVaultSize(sendResponse) {
+  try {
+    const database = await getDB();
+    const tx = database.transaction([STORE_NAME], 'readonly');
+    tx.objectStore(STORE_NAME).getAll().onsuccess = (e) => {
+      const records = e.target.result || [];
+      let total = 0;
+      records.forEach(r => {
+        if (r.size) total += r.size;
+      });
+      sendResponse({ success: true, size: total });
+    };
+  } catch (err) {
+    sendResponse({ success: false, size: 0, error: err.message });
+  }
+}
+
+async function handleCheckDuplicate(name, size, sendResponse) {
+  try {
+    const database = await getDB();
+    const tx = database.transaction([STORE_NAME], 'readonly');
+    let duplicate = null;
+    tx.objectStore(STORE_NAME).openCursor().onsuccess = (e) => {
+      const cursor = e.target.result;
+      if (cursor) {
+        const val = cursor.value;
+        if (val.name === name && val.size === size) {
+          duplicate = val;
+          // Return duplicate info without serialization issues
+          const duplicateMeta = { ...duplicate };
+          delete duplicateMeta.file;
+          sendResponse({ success: true, duplicate: duplicateMeta });
+          return;
+        }
+        cursor.continue();
+      } else {
+        sendResponse({ success: true, duplicate: null });
+      }
+    };
+  } catch (err) {
+    sendResponse({ success: false, error: err.message });
+  }
+}
+
+async function handleGetFileContent(id, sendResponse) {
+  try {
+    const database = await getDB();
+    const tx = database.transaction([STORE_NAME], 'readonly');
+    tx.objectStore(STORE_NAME).get(id).onsuccess = async (e) => {
+      const record = e.target.result;
+      if (record && record.file) {
+        const buffer = await record.file.arrayBuffer();
+        sendResponse({ success: true, arrayBuffer: buffer, type: record.type });
+      } else {
+        sendResponse({ success: false, error: "File not found" });
+      }
+    };
+  } catch (err) {
+    sendResponse({ success: false, error: err.message });
+  }
+}
+
+function broadcastUpdate() {
+  chrome.tabs.query({}, (tabs) => {
+    tabs.forEach(tab => {
+      try {
+        chrome.tabs.sendMessage(tab.id, { action: "VAULT_UPDATED" });
+      } catch (err) {
+        // Tab may not have content script injected
+      }
+    });
+  });
 }
