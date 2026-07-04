@@ -89,6 +89,32 @@ const getFileRecord = (id) => new Promise(async (resolve, reject) => {
   }
 });
 
+// Helper to convert stored file field (Blob/ArrayBuffer/base64) into a clean Blob
+function getRecordBlob(record) {
+  if (!record) return null;
+  
+  console.log(`[DEBUG SW] Normalizing record ID: ${record.id}, Name: ${record.name}`);
+
+  if (record.file instanceof Blob) {
+    console.log(`[DEBUG SW] Record file is Blob. Size: ${record.file.size}, MIME: ${record.file.type}`);
+    return record.file;
+  }
+  
+  if (record.file instanceof ArrayBuffer || ArrayBuffer.isView(record.file)) {
+    const size = record.file.byteLength || record.file.length;
+    console.log(`[DEBUG SW] Record file is ArrayBuffer. Size: ${size}, MIME: ${record.type}`);
+    return new Blob([record.file], { type: record.type });
+  }
+  
+  if (record.data) {
+    console.log(`[DEBUG SW] Record has legacy base64 data URL.`);
+    return dataURLtoBlob(record.data);
+  }
+  
+  console.warn(`[DEBUG SW] Record has no content payload!`);
+  return null;
+}
+
 // ─── MESSAGE LISTENERS ───
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === "OPEN_AUTH_WINDOW") {
@@ -118,6 +144,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
   if (request.action === "UPDATE_VAULT_FILE") {
     handleUpdateVaultFile(request.fileRecord, sendResponse);
+    return true;
+  }
+  if (request.action === "UPDATE_LAST_USED") {
+    handleUpdateLastUsed(request.id, sendResponse);
     return true;
   }
   if (request.action === "CLEAR_VAULT") {
@@ -226,6 +256,26 @@ async function handleUpdateVaultFile(fileRecord, sendResponse) {
   }
 }
 
+async function handleUpdateLastUsed(id, sendResponse) {
+  try {
+    const record = await getFileRecord(id);
+    if (record) {
+      record.lastUsed = Date.now();
+      const database = await getDB();
+      const tx = database.transaction([STORE_NAME], 'readwrite');
+      tx.objectStore(STORE_NAME).put(record);
+      tx.oncomplete = () => {
+        sendResponse({ success: true });
+        broadcastUpdate();
+      };
+    } else {
+      sendResponse({ success: false, error: "Record not found" });
+    }
+  } catch (err) {
+    sendResponse({ success: false, error: err.message });
+  }
+}
+
 async function handleClearVault(sendResponse) {
   try {
     const database = await getDB();
@@ -290,13 +340,17 @@ async function handleCheckDuplicate(name, size, sendResponse) {
 async function handleGetFileContent(id, sendResponse) {
   try {
     const record = await getFileRecord(id);
-    if (record && record.file) {
-      // Send raw arrayBuffer from database record
-      sendResponse({ success: true, arrayBuffer: record.file, type: record.type });
+    const blob = getRecordBlob(record);
+    if (blob) {
+      console.log(`[DEBUG SW] Sending content for record ID: ${id}. Blob instanceof Blob: ${blob instanceof Blob}, size: ${blob.size}, MIME: ${blob.type}`);
+      const buffer = await blob.arrayBuffer();
+      sendResponse({ success: true, arrayBuffer: buffer, type: blob.type });
     } else {
+      console.warn(`[DEBUG SW] Content not found for record ID: ${id}`);
       sendResponse({ success: false, error: "File not found" });
     }
   } catch (err) {
+    console.error(`[DEBUG SW] Error getting content for ID ${id}:`, err);
     sendResponse({ success: false, error: err.message });
   }
 }

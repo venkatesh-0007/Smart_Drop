@@ -13,18 +13,17 @@
       align-items: center;
       justify-content: center;
       background: transparent;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     }
     img {
       width: 100%;
       height: 100%;
       display: block;
-      /* default fit parameter */
       object-fit: cover;
     }
     img.contain {
       object-fit: contain;
     }
-    /* Simple spinner for image loading */
     .loader {
       width: 20px;
       height: 20px;
@@ -36,6 +35,20 @@
     @keyframes spin {
       to { transform: rotate(360deg); }
     }
+    .fallback {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      color: #8e8e93;
+      font-size: 11px;
+      text-align: center;
+      padding: 8px;
+    }
+    .fallback-icon {
+      font-size: 20px;
+      margin-bottom: 4px;
+    }
   </style>
 </head>
 <body>
@@ -45,29 +58,60 @@
     const fileId = parseInt(params.get('id'), 10);
     const fit = params.get('fit') || 'cover';
     
-    if (fileId) {
-      chrome.runtime.sendMessage({ action: "GET_FILE_CONTENT", id: fileId }, response => {
-        const loader = document.getElementById('loader');
-        if (loader) loader.remove();
-
-        if (response && response.success && response.arrayBuffer) {
-          const blob = new Blob([response.arrayBuffer], { type: response.type });
-          const url = URL.createObjectURL(blob);
-          
-          const img = document.createElement('img');
-          img.src = url;
-          if (fit === 'contain') {
-            img.className = 'contain';
-          }
-          document.body.appendChild(img);
-        } else {
-          // Render error layout if failed
-          document.body.innerHTML = '<span style="color:#ff453a;font-size:10px;">⚠️</span>';
-        }
-      });
-    } else {
+    function showFallback(msg = "Failed to load") {
       const loader = document.getElementById('loader');
       if (loader) loader.remove();
+      document.body.innerHTML = `
+        <div class="fallback">
+          <div class="fallback-icon">⚠️</div>
+          <div>${msg}</div>
+        </div>
+      `;
+    }
+
+    if (fileId) {
+      console.log(`[DEBUG FRAME] Fetching image content for file ID: ${fileId}`);
+      try {
+        chrome.runtime.sendMessage({ action: "GET_FILE_CONTENT", id: fileId }, response => {
+          const loader = document.getElementById('loader');
+          if (loader) loader.remove();
+
+          if (response && response.success && response.arrayBuffer) {
+            try {
+              const blob = new Blob([response.arrayBuffer], { type: response.type });
+              const url = URL.createObjectURL(blob);
+              console.log(`[DEBUG FRAME] Created temporary frame image URL: ${url}`);
+              
+              const img = document.createElement('img');
+              img.src = url;
+              if (fit === 'contain') {
+                img.className = 'contain';
+              }
+              img.onload = () => {
+                console.log(`[DEBUG FRAME] Image loaded successfully. Revoking: ${url}`);
+                URL.revokeObjectURL(url);
+              };
+              img.onerror = () => {
+                console.warn(`[DEBUG FRAME] Image load failed. Revoking: ${url}`);
+                URL.revokeObjectURL(url);
+                showFallback("Corrupt Image");
+              };
+              document.body.appendChild(img);
+            } catch (e) {
+              console.error("[DEBUG FRAME] Error creating blob or image element:", e);
+              showFallback("Render Error");
+            }
+          } else {
+            console.warn(`[DEBUG FRAME] Failed to get content for file ID: ${fileId}. Error:`, response?.error);
+            showFallback("Not Found");
+          }
+        });
+      } catch (err) {
+        console.error("[DEBUG FRAME] Sync error invoking sendMessage:", err);
+        showFallback("Connection Error");
+      }
+    } else {
+      showFallback("Invalid ID");
     }
   </script>
 </body>

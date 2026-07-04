@@ -40,11 +40,37 @@
     });
   });
 
+  // ─── VAULT MEMORY CACHE ───
+  const VaultCache = {
+    files: new Map(), // fileId -> File object
+    clear() {
+      console.log(`[DEBUG CONTENT] Clearing VaultCache`);
+      this.files.clear();
+    },
+    set(id, fileObj) {
+      console.log(`[DEBUG CONTENT] Caching file ID: ${id}, Name: ${fileObj.name}, Size: ${fileObj.size}, MIME: ${fileObj.type}`);
+      this.files.set(id, fileObj);
+    },
+    get(id) {
+      const fileObj = this.files.get(id);
+      if (fileObj) {
+        console.log(`[DEBUG CONTENT] Cache HIT for file ID: ${id}, Name: ${fileObj.name}`);
+      } else {
+        console.log(`[DEBUG CONTENT] Cache MISS for file ID: ${id}`);
+      }
+      return fileObj;
+    }
+  };
+
   const getFileContent = (id) => new Promise((resolve) => {
+    console.log(`[DEBUG CONTENT] Requesting file content from background worker for ID: ${id}`);
     chrome.runtime.sendMessage({ action: "GET_FILE_CONTENT", id }, response => {
       if (response && response.success && response.arrayBuffer) {
-        resolve(new Blob([response.arrayBuffer], { type: response.type }));
+        const blob = new Blob([response.arrayBuffer], { type: response.type });
+        console.log(`[DEBUG CONTENT] Content response received for ID: ${id}. Blob instanceof Blob: ${blob instanceof Blob}, size: ${blob.size}, MIME: ${blob.type}`);
+        resolve(blob);
       } else {
+        console.warn(`[DEBUG CONTENT] Content response failed or empty for ID: ${id}. Error:`, response?.error);
         resolve(null);
       }
     });
@@ -670,6 +696,7 @@
         return;
       }
 
+      // Clear or manage memory cache appropriately (we keep cache persistent across redraws for instant thumbnails)
       files.forEach(file => {
         const card = document.createElement('div');
         card.className = `file-card density-${State.cardDensity}`;
@@ -699,73 +726,105 @@
           </div>
         `;
 
-        // Cache Blob on mouse hover to support instant Drag & Drop DownloadURL
-        card.addEventListener('mouseenter', async () => {
-          if (!card.cachedBlob) {
-            const blob = await getFileContent(file.id);
-            if (blob) {
-              card.cachedBlob = blob;
-              if (isImage) {
-                const placeholder = card.querySelector('.preview-img-placeholder');
-                if (placeholder) {
-                  const frameUrl = chrome.runtime.getURL('thumbnail.html') + `?id=${file.id}&fit=cover`;
-                  placeholder.outerHTML = `<iframe src="${frameUrl}" class="preview-img" style="border:none;width:100%;height:100%;"></iframe>`;
-                }
-              }
-            }
+        // Helper to update card thumbnail element when image is preloaded
+        const updateCardThumbnail = (fileId, fileObj) => {
+          const placeholder = card.querySelector('.preview-img-placeholder');
+          if (placeholder) {
+            console.log(`[DEBUG CONTENT] Mounting image thumbnail frame for file ID: ${fileId}`);
+            const frameUrl = chrome.runtime.getURL('thumbnail.html') + `?id=${fileId}&fit=cover`;
+            placeholder.outerHTML = `<iframe src="${frameUrl}" class="preview-img" style="border:none;width:100%;height:100%;"></iframe>`;
           }
-        });
+        };
 
-        // Trigger lazy loading of images automatically after mounting
-        if (isImage) {
-          setTimeout(async () => {
-            if (!card.cachedBlob) {
-              const blob = await getFileContent(file.id);
-              if (blob) {
-                card.cachedBlob = blob;
-                const placeholder = card.querySelector('.preview-img-placeholder');
-                if (placeholder) {
-                  const frameUrl = chrome.runtime.getURL('thumbnail.html') + `?id=${file.id}&fit=cover`;
-                  placeholder.outerHTML = `<iframe src="${frameUrl}" class="preview-img" style="border:none;width:100%;height:100%;"></iframe>`;
-                }
+        // Cache preloaded File objects
+        const cachedFileObj = VaultCache.get(file.id);
+        if (cachedFileObj) {
+          if (isImage) {
+            setTimeout(() => updateCardThumbnail(file.id, cachedFileObj), 0);
+          }
+        } else {
+          // Asynchronously prefetch binary content and cache it
+          getFileContent(file.id).then(blob => {
+            if (blob) {
+              const fileObj = new File([blob], file.name, { type: file.type || blob.type, lastModified: file.timestamp });
+              VaultCache.set(file.id, fileObj);
+              if (isImage) {
+                updateCardThumbnail(file.id, fileObj);
               }
+            } else {
+              console.error(`[DEBUG CONTENT] Prefetch returned empty blob for file ID: ${file.id}`);
             }
-          }, 50);
+          }).catch(err => {
+            console.error(`[DEBUG CONTENT] Prefetch failed for file ID: ${file.id}:`, err);
+          });
         }
 
         // OUTBOUND DRAG HANDLING
         card.addEventListener('dragstart', (e) => {
-          State.isDraggingFromSidebar = true;
-          State.currentDraggedFile = file;
-          if (card.cachedBlob) {
-            file.file = card.cachedBlob;
+          const fileObj = VaultCache.get(file.id);
+          if (!fileObj) {
+            console.warn(`[DEBUG CONTENT] dragstart: File ID ${file.id} not preloaded yet!`);
+            // Fallback
+            State.isDraggingFromSidebar = true;
+            State.currentDraggedFile = null;
+            e.dataTransfer.effectAllowed = 'copy';
+            e.dataTransfer.setData('text/plain', file.name);
+            return;
           }
-          
-          e.dataTransfer.effectAllowed = 'copy';
-          e.dataTransfer.setData('text/plain', file.name);
+
+          console.log(`[DEBUG CONTENT] dragstart: File ID ${file.id} initialized. Name: ${fileObj.name}, Size: ${fileObj.size}`);
+
+          State.isDraggingFromSidebar = true;
+          State.currentDraggedFile = fileObj;
           card.classList.add('dragging');
 
-          const blob = card.cachedBlob;
-          if (blob) {
-            const tempUrl = URL.createObjectURL(blob);
-            const downloadString = `${file.type || 'application/octet-stream'}:${file.name}:${tempUrl}`;
-            e.dataTransfer.setData("DownloadURL", downloadString);
-            State.currentObjectURLs.add(tempUrl);
+          e.dataTransfer.effectAllowed = 'copy';
+          
+          // Populate the drag payload:
+          // 1. text/plain for filename/fallback
+          e.dataTransfer.setData('text/plain', fileObj.name);
+
+          // 2. Add the real File object natively to items
+          try {
+            e.dataTransfer.items.add(fileObj);
+            console.log(`[DEBUG CONTENT] Added File to DataTransfer items. Count: ${e.dataTransfer.items.length}`);
+          } catch (err) {
+            console.error(`[DEBUG CONTENT] Failed to add File to DataTransfer items:`, err);
           }
+
+          // 3. DownloadURL for desktop drags
+          const tempUrl = URL.createObjectURL(fileObj);
+          State.currentObjectURLs.add(tempUrl);
+          console.log(`[DEBUG CONTENT] Created temporary drag DownloadURL object URL: ${tempUrl}`);
+          
+          const downloadString = `${fileObj.type || 'application/octet-stream'}:${fileObj.name}:${tempUrl}`;
+          e.dataTransfer.setData("DownloadURL", downloadString);
+
+          // 4. Internal metadata
+          e.dataTransfer.setData('application/json', JSON.stringify({ fileId: file.id, name: file.name, source: 'smart-drop' }));
         });
 
         card.addEventListener('dragend', () => {
+          console.log(`[DEBUG CONTENT] dragend: Dragging finished/cancelled.`);
           State.isDraggingFromSidebar = false;
+          State.currentDraggedFile = null;
           card.classList.remove('dragging');
         });
 
         card.addEventListener('dblclick', async () => {
-          const blob = card.cachedBlob || await getFileContent(file.id);
-          if (blob) {
-            file.file = blob;
-            openPreview(file);
+          const fileObj = VaultCache.get(file.id);
+          if (fileObj) {
+            openPreview(fileObj, file.id, file.timestamp);
           } else {
-            showToast("Failed to load file data", "error");
+            showToast("Loading file content, please try again...", "info");
+            const blob = await getFileContent(file.id);
+            if (blob) {
+              const fObj = new File([blob], file.name, { type: file.type || blob.type, lastModified: file.timestamp });
+              VaultCache.set(file.id, fObj);
+              openPreview(fObj, file.id, file.timestamp);
+            } else {
+              showToast("Failed to load file data", "error");
+            }
           }
         });
 
@@ -780,48 +839,64 @@
   };
 
   // ─── FILE PREVIEWS ───
-  const openPreview = async (file) => {
-    file.lastUsed = Date.now();
-    const updateRecord = { ...file };
-    delete updateRecord.file;
-    chrome.runtime.sendMessage({ action: "UPDATE_VAULT_FILE", fileRecord: updateRecord });
+  const openFileInNewTab = (fileObj, fileId) => {
+    chrome.runtime.sendMessage({ action: "UPDATE_LAST_USED", id: fileId });
+
+    console.log(`[DEBUG CONTENT] Opening file in new tab. Name: ${fileObj.name}, Type: ${fileObj.type}`);
+    const objectUrl = URL.createObjectURL(fileObj);
+    State.currentObjectURLs.add(objectUrl);
+    console.log(`[DEBUG CONTENT] Created temporary new-tab object URL: ${objectUrl}`);
+
+    window.open(objectUrl, '_blank');
+
+    // Safe lifecycle revocation: allow the browser 15 seconds to fetch and display the content
+    setTimeout(() => {
+      console.log(`[DEBUG CONTENT] Revoking temporary new-tab object URL: ${objectUrl}`);
+      URL.revokeObjectURL(objectUrl);
+      State.currentObjectURLs.delete(objectUrl);
+    }, 15000);
+  };
+
+  const openPreview = async (fileObj, fileId, timestamp) => {
+    chrome.runtime.sendMessage({ action: "UPDATE_LAST_USED", id: fileId });
 
     const container = host.getElementById('preview-content-container');
     container.innerHTML = '<div class="preview-loading">Generating preview...</div>';
 
-    host.getElementById('meta-name').innerText = file.name;
-    host.getElementById('meta-size').innerText = `${(file.size / 1024).toFixed(1)} KB`;
-    host.getElementById('meta-type').innerText = file.type || 'Unknown';
-    host.getElementById('meta-added').innerText = new Date(file.timestamp).toLocaleString();
-    host.getElementById('meta-used').innerText = new Date(file.lastUsed).toLocaleString();
+    host.getElementById('meta-name').innerText = fileObj.name;
+    host.getElementById('meta-size').innerText = `${(fileObj.size / 1024).toFixed(1)} KB`;
+    host.getElementById('meta-type').innerText = fileObj.type || 'Unknown';
+    host.getElementById('meta-added').innerText = new Date(timestamp).toLocaleString();
+    host.getElementById('meta-used').innerText = new Date().toLocaleString();
 
-    let blob = file.file;
-    if (!blob) {
-      container.innerHTML = '<div class="preview-error">File payload missing</div>';
+    if (!(fileObj instanceof File) && !(fileObj instanceof Blob)) {
+      console.error("[DEBUG CONTENT] Preview target is not a valid File or Blob!", fileObj);
+      container.innerHTML = '<div class="preview-error">File payload invalid</div>';
       previewOverlay.classList.add('open');
       return;
     }
 
-    const objectUrl = URL.createObjectURL(blob);
+    const objectUrl = URL.createObjectURL(fileObj);
     State.currentObjectURLs.add(objectUrl);
+    console.log(`[DEBUG CONTENT] Created preview object URL: ${objectUrl}`);
 
     const downloadBtn = host.getElementById('download-preview');
     downloadBtn.onclick = () => {
       const a = document.createElement('a');
       a.href = objectUrl;
-      a.download = file.name;
+      a.download = fileObj.name;
       a.click();
     };
 
-    const type = (file.type || '').toLowerCase();
-    const ext = file.name.split('.').pop().toLowerCase();
+    const type = (fileObj.type || '').toLowerCase();
+    const ext = fileObj.name.split('.').pop().toLowerCase();
 
     if (type.startsWith('image/') || ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico'].includes(ext)) {
-      const frameUrl = chrome.runtime.getURL('thumbnail.html') + `?id=${file.id}&fit=contain`;
+      const frameUrl = chrome.runtime.getURL('thumbnail.html') + `?id=${fileId}&fit=contain`;
       container.innerHTML = `<iframe src="${frameUrl}" class="full-preview-img-frame" style="border:none;width:100%;height:100%;"></iframe>`;
     } else if (type.startsWith('text/') || ['json', 'csv', 'js', 'css', 'html', 'xml', 'txt', 'md'].includes(ext)) {
       try {
-        const text = await blob.text();
+        const text = await fileObj.text();
         const snippet = text.length > 50000 ? text.substring(0, 50000) + '\n\n[Truncated for performance]' : text;
         container.innerHTML = `<pre class="preview-text-box"><code>${escapeHtml(snippet)}</code></pre>`;
       } catch (err) {
@@ -867,6 +942,10 @@
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
         Preview
       </button>
+      <button class="menu-item action-open-tab">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+        Open in New Tab
+      </button>
       <button class="menu-item action-favorite">
         <svg width="12" height="12" viewBox="0 0 24 24" fill="${isFav ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
         ${isFav ? 'Unfavorite' : 'Favorite'}
@@ -894,12 +973,37 @@
 
     menu.querySelector('.action-preview').onclick = async () => {
       menu.classList.add('hidden');
-      const blob = triggerElement.closest('.file-card').cachedBlob || await getFileContent(file.id);
-      if (blob) {
-        file.file = blob;
-        openPreview(file);
+      const fileObj = VaultCache.get(file.id);
+      if (fileObj) {
+        openPreview(fileObj, file.id, file.timestamp);
       } else {
-        showToast("Failed to load file preview", "error");
+        showToast("Loading file preview...", "info");
+        const blob = await getFileContent(file.id);
+        if (blob) {
+          const fObj = new File([blob], file.name, { type: file.type || blob.type, lastModified: file.timestamp });
+          VaultCache.set(file.id, fObj);
+          openPreview(fObj, file.id, file.timestamp);
+        } else {
+          showToast("Failed to load file preview", "error");
+        }
+      }
+    };
+
+    menu.querySelector('.action-open-tab').onclick = async () => {
+      menu.classList.add('hidden');
+      const fileObj = VaultCache.get(file.id);
+      if (fileObj) {
+        openFileInNewTab(fileObj, file.id);
+      } else {
+        showToast("Loading file content...", "info");
+        const blob = await getFileContent(file.id);
+        if (blob) {
+          const fObj = new File([blob], file.name, { type: file.type || blob.type, lastModified: file.timestamp });
+          VaultCache.set(file.id, fObj);
+          openFileInNewTab(fObj, file.id);
+        } else {
+          showToast("Failed to open file", "error");
+        }
       }
     };
 
@@ -925,6 +1029,13 @@
       });
       if (newName && newName !== file.name) {
         file.name = newName;
+        // Update name in cache
+        const cachedFile = VaultCache.get(file.id);
+        if (cachedFile) {
+          const updatedFile = new File([cachedFile], newName, { type: cachedFile.type, lastModified: Date.now() });
+          VaultCache.set(file.id, updatedFile);
+        }
+
         const updateRecord = { ...file };
         delete updateRecord.file;
         chrome.runtime.sendMessage({ action: "UPDATE_VAULT_FILE", fileRecord: updateRecord }, response => {
@@ -938,14 +1049,24 @@
 
     menu.querySelector('.action-download').onclick = async () => {
       menu.classList.add('hidden');
-      const blob = triggerElement.closest('.file-card').cachedBlob || await getFileContent(file.id);
-      if (blob) {
-        const url = URL.createObjectURL(blob);
+      const fileObj = VaultCache.get(file.id);
+      if (fileObj) {
+        chrome.runtime.sendMessage({ action: "UPDATE_LAST_USED", id: file.id });
+        const url = URL.createObjectURL(fileObj);
+        State.currentObjectURLs.add(url);
+        console.log(`[DEBUG CONTENT] Created download URL: ${url}`);
+        
         const a = document.createElement('a');
         a.href = url;
-        a.download = file.name;
+        a.download = fileObj.name;
         a.click();
-        URL.revokeObjectURL(url);
+        
+        // Revoke after a safe 5-second interval
+        setTimeout(() => {
+          console.log(`[DEBUG CONTENT] Revoking download URL: ${url}`);
+          URL.revokeObjectURL(url);
+          State.currentObjectURLs.delete(url);
+        }, 5000);
       } else {
         showToast("Download failed", "error");
       }
@@ -961,6 +1082,7 @@
       });
       if (conf) {
         await deleteFileById(file.id);
+        VaultCache.files.delete(file.id);
         renderVault();
         updateSettingsUI();
         showToast('Deleted file', 'success');
@@ -1303,43 +1425,101 @@
 
   document.addEventListener('drop', () => dropZone.classList.remove('dragover'), true);
 
+  // Helper to safely clean up drag state
+  const cleanDragState = () => {
+    console.log(`[DEBUG CONTENT] Cleaning drag state.`);
+    State.isDraggingFromSidebar = false;
+    State.currentDraggedFile = null;
+    const draggingCards = host.querySelectorAll('.file-card.dragging');
+    draggingCards.forEach(c => c.classList.remove('dragging'));
+  };
+
   // DROP FROM VAULT OUT TO PAGE TARGETS
   document.addEventListener('dragover', (e) => {
-    if (State.isDraggingFromSidebar) { 
+    if (State.isDraggingFromSidebar && State.currentDraggedFile) { 
       e.preventDefault(); 
       e.dataTransfer.dropEffect = 'copy'; 
     }
   });
 
   document.addEventListener('drop', (e) => {
+    // Avoid handling our own synthetic drops
+    if (e._isSmartDropSynthetic) {
+      console.log(`[DEBUG CONTENT] Ignoring synthetic Smart Drop event in document drop handler.`);
+      return;
+    }
+
     if (State.isDraggingFromSidebar && State.currentDraggedFile) {
+      const fileObj = State.currentDraggedFile;
+      console.log(`[DEBUG CONTENT] Intercepted drop event on page. Target: ${e.target.tagName}, ID: ${e.target.id}, Class: ${e.target.className}`);
+
+      // We handle the drop, so prevent browser defaults
       e.preventDefault(); 
       e.stopPropagation();
+
+      // Check if dropped onto a file input (or child of a file input)
+      const fileInput = e.composedPath().find(el => el.tagName === 'INPUT' && el.type === 'file');
       
-      let blob = State.currentDraggedFile.file;
-      if (!blob && State.currentDraggedFile.data) {
-        blob = dataURLtoBlob(State.currentDraggedFile.data);
-      }
-      
-      if (blob) {
-        const fileObj = new File([blob], State.currentDraggedFile.name, { type: State.currentDraggedFile.type });
-        const dt = new DataTransfer(); 
-        dt.items.add(fileObj);
-        const target = e.target;
-        
-        if (target.tagName === 'INPUT' && target.type === 'file') {
-          try {
-            target.files = dt.files;
-            target.dispatchEvent(new Event('change', { bubbles: true }));
-          } catch (err) {
-            target.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt }));
+      if (fileInput) {
+        console.log(`[DEBUG CONTENT] File input detected! Injecting File.`);
+        try {
+          const dt = new DataTransfer();
+          dt.items.add(fileObj);
+          fileInput.files = dt.files;
+          
+          console.log(`[DEBUG CONTENT] DataTransfer file count assigned to input: ${fileInput.files.length}`);
+
+          // Dispatch bubbling input and change events so page frameworks detect the change
+          fileInput.dispatchEvent(new Event('input', { bubbles: true }));
+          fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+          
+          showToast(`Uploaded ${fileObj.name} to input`, 'success');
+          
+          if (fileObj.id) {
+            chrome.runtime.sendMessage({ action: "UPDATE_LAST_USED", id: fileObj.id });
           }
-        } else {
-          target.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt }));
+        } catch (err) {
+          console.error(`[DEBUG CONTENT] Error injecting file into input:`, err);
+          showToast("Failed to upload file to input", "error");
         }
+        cleanDragState();
+        return;
       }
-      State.currentDraggedFile = null;
-      State.isDraggingFromSidebar = false;
+
+      // For custom website drop zones, dispatch a single synthetic DragEvent with a populated DataTransfer
+      console.log(`[DEBUG CONTENT] Custom dropzone target. Dispatching synthetic drop event.`);
+      try {
+        const dt = new DataTransfer();
+        dt.items.add(fileObj);
+        
+        const syntheticEvent = new DragEvent('drop', {
+          bubbles: true,
+          cancelable: true,
+          dataTransfer: dt
+        });
+        
+        // Custom flag to prevent recursion
+        syntheticEvent._isSmartDropSynthetic = true;
+
+        const target = e.target;
+        target.dispatchEvent(syntheticEvent);
+
+        if (!syntheticEvent.defaultPrevented) {
+          console.log(`[DEBUG CONTENT] Synthetic event not prevented by website drop handler.`);
+          showToast("This website may not accept browser-generated file drops.", "info");
+        } else {
+          console.log(`[DEBUG CONTENT] Synthetic event successfully handled by website.`);
+          showToast(`Dropped ${fileObj.name}`, "success");
+          if (fileObj.id) {
+            chrome.runtime.sendMessage({ action: "UPDATE_LAST_USED", id: fileObj.id });
+          }
+        }
+      } catch (err) {
+        console.error(`[DEBUG CONTENT] Custom dropzone dispatch failed:`, err);
+        showToast("This website does not accept browser-generated file drops.", "info");
+      }
+
+      cleanDragState();
     }
   }, true);
 
