@@ -40,6 +40,16 @@
     });
   });
 
+  const getFileContent = (id) => new Promise((resolve) => {
+    chrome.runtime.sendMessage({ action: "GET_FILE_CONTENT", id }, response => {
+      if (response && response.success && response.arrayBuffer) {
+        resolve(new Blob([response.arrayBuffer], { type: response.type }));
+      } else {
+        resolve(null);
+      }
+    });
+  });
+
   // ─── SHADOW DOM SETUPS ───
   const container = document.createElement('div');
   container.id = 'smart-drop-root';
@@ -531,26 +541,31 @@
       }
     }
 
-    return new Promise((resolve) => {
-      const fileRecord = {
-        name: file.name,
-        type: file.type || 'application/octet-stream',
-        file: file,
-        size: file.size,
-        timestamp: Date.now(),
-        lastUsed: Date.now(),
-        isFavorite: false
-      };
+    return new Promise(async (resolve) => {
+      try {
+        const arrayBuffer = await file.arrayBuffer();
+        const fileRecord = {
+          name: file.name,
+          type: file.type || 'application/octet-stream',
+          size: file.size,
+          timestamp: Date.now(),
+          lastUsed: Date.now(),
+          isFavorite: false
+        };
 
-      chrome.runtime.sendMessage({ action: "SAVE_VAULT_FILE", fileRecord }, response => {
-        if (response?.success) {
-          showToast(`Saved ${file.name}`, 'success');
-          resolve(true);
-        } else {
-          showToast(`Failed to save: ${file.name}`, 'error');
-          resolve(false);
-        }
-      });
+        chrome.runtime.sendMessage({ action: "SAVE_VAULT_FILE", fileRecord, arrayBuffer }, response => {
+          if (response?.success) {
+            showToast(`Saved ${file.name}`, 'success');
+            resolve(true);
+          } else {
+            showToast(`Failed to save: ${file.name}`, 'error');
+            resolve(false);
+          }
+        });
+      } catch (err) {
+        showToast(`Failed to read file: ${err.message}`, 'error');
+        resolve(false);
+      }
     });
   };
 
@@ -667,14 +682,7 @@
 
         let previewHtml = `<span class="file-icon">${iconHtml}</span>`;
         if (isImage) {
-          let imgUrl = '';
-          if (file.file) {
-            imgUrl = URL.createObjectURL(file.file);
-            State.currentObjectURLs.add(imgUrl);
-          }
-          if (imgUrl) {
-            previewHtml = `<img src="${imgUrl}" class="preview-img" alt="${escapeHtml(file.name)}">`;
-          }
+          previewHtml = `<div class="preview-img-placeholder">${iconHtml}</div>`;
         }
 
         const sizeStr = file.size ? `${(file.size / 1024).toFixed(1)} KB` : '0 KB';
@@ -691,18 +699,60 @@
           </div>
         `;
 
+        // Cache Blob on mouse hover to support instant Drag & Drop DownloadURL
+        card.addEventListener('mouseenter', async () => {
+          if (!card.cachedBlob) {
+            const blob = await getFileContent(file.id);
+            if (blob) {
+              card.cachedBlob = blob;
+              if (isImage) {
+                const imgUrl = URL.createObjectURL(blob);
+                State.currentObjectURLs.add(imgUrl);
+                const placeholder = card.querySelector('.preview-img-placeholder');
+                if (placeholder) {
+                  placeholder.outerHTML = `<img src="${imgUrl}" class="preview-img" alt="${escapeHtml(file.name)}">`;
+                }
+              }
+            }
+          }
+        });
+
+        // Trigger lazy loading of images automatically after mounting
+        if (isImage) {
+          setTimeout(async () => {
+            if (!card.cachedBlob) {
+              const blob = await getFileContent(file.id);
+              if (blob) {
+                card.cachedBlob = blob;
+                const imgUrl = URL.createObjectURL(blob);
+                State.currentObjectURLs.add(imgUrl);
+                const placeholder = card.querySelector('.preview-img-placeholder');
+                if (placeholder) {
+                  placeholder.outerHTML = `<img src="${imgUrl}" class="preview-img" alt="${escapeHtml(file.name)}">`;
+                }
+              }
+            }
+          }, 50);
+        }
+
+        // OUTBOUND DRAG HANDLING
         card.addEventListener('dragstart', (e) => {
           State.isDraggingFromSidebar = true;
           State.currentDraggedFile = file;
+          if (card.cachedBlob) {
+            file.file = card.cachedBlob;
+          }
+          
           e.dataTransfer.effectAllowed = 'copy';
           e.dataTransfer.setData('text/plain', file.name);
           card.classList.add('dragging');
 
-          let blob = file.file;
+          const blob = card.cachedBlob;
           if (blob) {
             const tempUrl = URL.createObjectURL(blob);
             const downloadString = `${file.type || 'application/octet-stream'}:${file.name}:${tempUrl}`;
             e.dataTransfer.setData("DownloadURL", downloadString);
+            State.currentObjectURLs.add(tempUrl);
           }
         });
 
@@ -711,7 +761,15 @@
           card.classList.remove('dragging');
         });
 
-        card.addEventListener('dblclick', () => openPreview(file));
+        card.addEventListener('dblclick', async () => {
+          const blob = card.cachedBlob || await getFileContent(file.id);
+          if (blob) {
+            file.file = blob;
+            openPreview(file);
+          } else {
+            showToast("Failed to load file data", "error");
+          }
+        });
 
         card.querySelector('.file-menu-trigger').addEventListener('click', (ev) => {
           ev.stopPropagation();
@@ -833,9 +891,15 @@
     menu.style.left = `${rect.left - sidebarRect.left - 100}px`;
     menu.classList.remove('hidden');
 
-    menu.querySelector('.action-preview').onclick = () => {
+    menu.querySelector('.action-preview').onclick = async () => {
       menu.classList.add('hidden');
-      openPreview(file);
+      const blob = triggerElement.closest('.file-card').cachedBlob || await getFileContent(file.id);
+      if (blob) {
+        file.file = blob;
+        openPreview(file);
+      } else {
+        showToast("Failed to load file preview", "error");
+      }
     };
 
     menu.querySelector('.action-favorite').onclick = () => {
@@ -867,9 +931,9 @@
       }
     };
 
-    menu.querySelector('.action-download').onclick = () => {
+    menu.querySelector('.action-download').onclick = async () => {
       menu.classList.add('hidden');
-      let blob = file.file;
+      const blob = triggerElement.closest('.file-card').cachedBlob || await getFileContent(file.id);
       if (blob) {
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
@@ -877,6 +941,8 @@
         a.download = file.name;
         a.click();
         URL.revokeObjectURL(url);
+      } else {
+        showToast("Download failed", "error");
       }
     };
 
