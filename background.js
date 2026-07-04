@@ -358,11 +358,10 @@ async function handleGetFileContent(id, sendResponse) {
 function broadcastUpdate() {
   chrome.tabs.query({}, (tabs) => {
     tabs.forEach(tab => {
-      try {
-        chrome.tabs.sendMessage(tab.id, { action: "VAULT_UPDATED" });
-      } catch (err) {
-        // Tab may not have content script injected
-      }
+      chrome.tabs.sendMessage(tab.id, { action: "VAULT_UPDATED" }, () => {
+        // Accessing chrome.runtime.lastError suppresses the 'Could not establish connection' warning
+        const err = chrome.runtime.lastError;
+      });
     });
   });
 }
