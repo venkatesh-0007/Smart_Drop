@@ -782,7 +782,9 @@
   // ─── FILE PREVIEWS ───
   const openPreview = async (file) => {
     file.lastUsed = Date.now();
-    chrome.runtime.sendMessage({ action: "UPDATE_VAULT_FILE", fileRecord: file });
+    const updateRecord = { ...file };
+    delete updateRecord.file;
+    chrome.runtime.sendMessage({ action: "UPDATE_VAULT_FILE", fileRecord: updateRecord });
 
     const container = host.getElementById('preview-content-container');
     container.innerHTML = '<div class="preview-loading">Generating preview...</div>';
@@ -904,7 +906,9 @@
     menu.querySelector('.action-favorite').onclick = () => {
       menu.classList.add('hidden');
       file.isFavorite = !file.isFavorite;
-      chrome.runtime.sendMessage({ action: "UPDATE_VAULT_FILE", fileRecord: file }, response => {
+      const updateRecord = { ...file };
+      delete updateRecord.file;
+      chrome.runtime.sendMessage({ action: "UPDATE_VAULT_FILE", fileRecord: updateRecord }, response => {
         if (response?.success) {
           renderVault();
           showToast(file.isFavorite ? 'Added to Favorites' : 'Removed from Favorites', 'success');
@@ -921,7 +925,9 @@
       });
       if (newName && newName !== file.name) {
         file.name = newName;
-        chrome.runtime.sendMessage({ action: "UPDATE_VAULT_FILE", fileRecord: file }, response => {
+        const updateRecord = { ...file };
+        delete updateRecord.file;
+        chrome.runtime.sendMessage({ action: "UPDATE_VAULT_FILE", fileRecord: updateRecord }, response => {
           if (response?.success) {
             renderVault();
             showToast('File renamed', 'success');

@@ -77,6 +77,18 @@ async function getDB() {
   return db;
 }
 
+const getFileRecord = (id) => new Promise(async (resolve, reject) => {
+  try {
+    const database = await getDB();
+    const tx = database.transaction([STORE_NAME], 'readonly');
+    const req = tx.objectStore(STORE_NAME).get(id);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  } catch (err) {
+    reject(err);
+  }
+});
+
 // ─── MESSAGE LISTENERS ───
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === "OPEN_AUTH_WINDOW") {
@@ -150,9 +162,8 @@ async function handleSaveVaultFile(fileRecord, arrayBuffer, sendResponse) {
     const database = await getDB();
     const tx = database.transaction([STORE_NAME], 'readwrite');
     
-    // Reconstruct native Blob from arrayBuffer transfer
-    const blob = new Blob([arrayBuffer], { type: fileRecord.type });
-    fileRecord.file = blob;
+    // Save arrayBuffer directly inside the record (no Blob conversions inside SW)
+    fileRecord.file = arrayBuffer;
 
     tx.objectStore(STORE_NAME).add(fileRecord);
     tx.oncomplete = () => {
@@ -188,13 +199,15 @@ async function handleUpdateVaultFile(fileRecord, sendResponse) {
   try {
     const database = await getDB();
     const tx = database.transaction([STORE_NAME], 'readwrite');
-    
-    // Maintain existing Blob content if not provided in update payload
     const store = tx.objectStore(STORE_NAME);
+    
     store.get(fileRecord.id).onsuccess = (e) => {
       const existing = e.target.result;
       if (existing) {
-        if (!fileRecord.file && existing.file) {
+        // Defensive check: keep existing binary payload if the update record contains empty/null file field
+        const fileFieldIsEmpty = !fileRecord.file || 
+                                 (typeof fileRecord.file === 'object' && Object.keys(fileRecord.file).length === 0);
+        if (fileFieldIsEmpty && existing.file) {
           fileRecord.file = existing.file;
         }
         store.put(fileRecord);
@@ -276,17 +289,13 @@ async function handleCheckDuplicate(name, size, sendResponse) {
 
 async function handleGetFileContent(id, sendResponse) {
   try {
-    const database = await getDB();
-    const tx = database.transaction([STORE_NAME], 'readonly');
-    tx.objectStore(STORE_NAME).get(id).onsuccess = async (e) => {
-      const record = e.target.result;
-      if (record && record.file) {
-        const buffer = await record.file.arrayBuffer();
-        sendResponse({ success: true, arrayBuffer: buffer, type: record.type });
-      } else {
-        sendResponse({ success: false, error: "File not found" });
-      }
-    };
+    const record = await getFileRecord(id);
+    if (record && record.file) {
+      // Send raw arrayBuffer from database record
+      sendResponse({ success: true, arrayBuffer: record.file, type: record.type });
+    } else {
+      sendResponse({ success: false, error: "File not found" });
+    }
   } catch (err) {
     sendResponse({ success: false, error: err.message });
   }
