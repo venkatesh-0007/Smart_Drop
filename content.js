@@ -706,11 +706,10 @@
             if (blob) {
               card.cachedBlob = blob;
               if (isImage) {
-                const imgUrl = URL.createObjectURL(blob);
-                State.currentObjectURLs.add(imgUrl);
                 const placeholder = card.querySelector('.preview-img-placeholder');
                 if (placeholder) {
-                  placeholder.outerHTML = `<img src="${imgUrl}" class="preview-img" alt="${escapeHtml(file.name)}">`;
+                  const frameUrl = chrome.runtime.getURL('thumbnail.html') + `?id=${file.id}&fit=cover`;
+                  placeholder.outerHTML = `<iframe src="${frameUrl}" class="preview-img" style="border:none;width:100%;height:100%;"></iframe>`;
                 }
               }
             }
@@ -724,11 +723,10 @@
               const blob = await getFileContent(file.id);
               if (blob) {
                 card.cachedBlob = blob;
-                const imgUrl = URL.createObjectURL(blob);
-                State.currentObjectURLs.add(imgUrl);
                 const placeholder = card.querySelector('.preview-img-placeholder');
                 if (placeholder) {
-                  placeholder.outerHTML = `<img src="${imgUrl}" class="preview-img" alt="${escapeHtml(file.name)}">`;
+                  const frameUrl = chrome.runtime.getURL('thumbnail.html') + `?id=${file.id}&fit=cover`;
+                  placeholder.outerHTML = `<iframe src="${frameUrl}" class="preview-img" style="border:none;width:100%;height:100%;"></iframe>`;
                 }
               }
             }
@@ -817,7 +815,8 @@
     const ext = file.name.split('.').pop().toLowerCase();
 
     if (type.startsWith('image/') || ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico'].includes(ext)) {
-      container.innerHTML = `<img src="${objectUrl}" class="full-preview-img" alt="${escapeHtml(file.name)}">`;
+      const frameUrl = chrome.runtime.getURL('thumbnail.html') + `?id=${file.id}&fit=contain`;
+      container.innerHTML = `<iframe src="${frameUrl}" class="full-preview-img-frame" style="border:none;width:100%;height:100%;"></iframe>`;
     } else if (type.startsWith('text/') || ['json', 'csv', 'js', 'css', 'html', 'xml', 'txt', 'md'].includes(ext)) {
       try {
         const text = await blob.text();
